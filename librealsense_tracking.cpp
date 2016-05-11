@@ -336,7 +336,7 @@ public:
     pcl::PassThrough<PointType> pass;
     //CloudPtr res (new pcl::PointCloud<pcl::PointXYZRGBA>);
     pass.setFilterFieldName ("z");
-    pass.setFilterLimits (-10.0, 0.0);//changed
+    pass.setFilterLimits (-1.0, 0.0);//changed
     //pass.setFilterLimits (0.0, 1.5);
     //pass.setFilterLimits (0.0, 0.6);
     pass.setKeepOrganized (false);
@@ -540,7 +540,6 @@ public:
     pcl::ModelCoefficients::Ptr coefficients (new pcl::ModelCoefficients ());
     pcl::PointIndices::Ptr inliers (new pcl::PointIndices ());
     filterPassThrough (cloud, *cloud_pass_);
-    std::cout << "after filterPassThrough" << std::endl;
     if (counter_ < 10)
     {
       gridSample (cloud_pass_, *cloud_pass_downsampled_, downsampling_grid_size_);
@@ -555,7 +554,6 @@ public:
       {
         //planeSegmentation (cloud, *coefficients, *inliers);
         planeSegmentation (cloud_pass_downsampled_, *coefficients, *inliers);
-        std::cout << "after planesegmentation" << std::endl;
         if (inliers->indices.size () > 3)
         {
           CloudPtr cloud_projected (new Cloud);
@@ -564,11 +562,8 @@ public:
           
           //planeProjection (cloud, *cloud_projected, coefficients);
           planeProjection (cloud_pass_downsampled_, *cloud_projected, coefficients);
-          std::cout << "after planeprojection" << std::endl;
           convexHull (cloud_projected, *cloud_hull_, hull_vertices_);
-          std::cout << "after convexHull" << std::endl;
           extractNonPlanePoints (cloud_pass_downsampled_, cloud_hull_, *nonplane_cloud_);
-          std::cout << "after extractNonPlanePoints" << std::endl;
           target_cloud = nonplane_cloud_;
         }
         else
@@ -651,9 +646,7 @@ public:
       //*cloud_pass_downsampled_ = *cloud_pass_;
       //cloud_pass_downsampled_ = cloud_pass_;
       gridSampleApprox (cloud_pass_, *cloud_pass_downsampled_, downsampling_grid_size_);
-      std::cout << "after gridSampleApprox" << std::endl;
       tracking (cloud_pass_downsampled_);
-      std::cout << "after tracking" << std::endl;
     }
     
     new_cloud_ = true;
