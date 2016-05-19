@@ -132,7 +132,9 @@ public:
   LibRealSenseSegmentTracking (const std::string& device_id, int thread_nr, double downsampling_grid_size,
                          bool use_convex_hull,
                          bool visualize_non_downsample, bool visualize_particles,
-                         bool use_fixed)
+                         bool use_fixed,
+                         bool use_fixed_model,
+                         std::string model_filename)
   : viewer_ ("PCL LibRealSense Tracking Viewer")
   , device_id_ (device_id)
   , new_cloud_ (false)
@@ -142,6 +144,8 @@ public:
   , visualize_non_downsample_ (visualize_non_downsample)
   , visualize_particles_ (visualize_particles)
   , downsampling_grid_size_ (downsampling_grid_size)
+  , use_fixed_model_ (use_fixed_model)
+  , model_filename_ (model_filename)
   {
     KdTreePtr tree (new KdTree (false));
     ne_.setSearchMethod (tree);//need this to set neighbors
@@ -152,6 +156,8 @@ public:
     default_step_covariance[4] *= 40.0;
     default_step_covariance[5] *= 40.0;
     
+    viewer_.registerKeyboardCallback (&LibRealSenseSegmentTracking::keyboardCallback, *this);
+
     std::vector<double> initial_noise_covariance = std::vector<double> (6, 0.00001);
     std::vector<double> default_initial_mean = std::vector<double> (6, 0.0);
     if (use_fixed)
@@ -209,6 +215,20 @@ public:
     coherence->setSearchMethod (search);
     coherence->setMaximumDistance (0.01);
     tracker_->setCloudCoherence (coherence);
+  }
+
+  void
+  keyboardCallback (const pcl::visualization::KeyboardEvent& event, void*)
+  {
+    if (event.keyDown ())
+    {
+      if (event.getKeyCode () == 's' || event.getKeyCode () == 'S')
+      {
+        pcl::io::savePCDFileASCII ("model.pcd", *segmented_cloud_);
+        std::cerr << "Saved " << segmented_cloud_->points.size () << " data points to model.pcd." << std::endl;
+      }
+    }
+
   }
 
   bool
@@ -547,92 +567,122 @@ public:
     }
     else if (counter_ == 10)
     {
-      //gridSample (cloud_pass_, *cloud_pass_downsampled_, 0.01);
-      cloud_pass_downsampled_ = cloud_pass_;
-      CloudPtr target_cloud;
-      if (use_convex_hull_)
+      if(!use_fixed_model_)
       {
-        //planeSegmentation (cloud, *coefficients, *inliers);
-        planeSegmentation (cloud_pass_downsampled_, *coefficients, *inliers);
-        if (inliers->indices.size () > 3)
+      //gridSample (cloud_pass_, *cloud_pass_downsampled_, 0.01);
+        cloud_pass_downsampled_ = cloud_pass_;
+        CloudPtr target_cloud;
+        if (use_convex_hull_)
         {
-          CloudPtr cloud_projected (new Cloud);
-          cloud_hull_.reset (new Cloud);
-          nonplane_cloud_.reset (new Cloud);
-          
-          //planeProjection (cloud, *cloud_projected, coefficients);
-          planeProjection (cloud_pass_downsampled_, *cloud_projected, coefficients);
-          convexHull (cloud_projected, *cloud_hull_, hull_vertices_);
-          extractNonPlanePoints (cloud_pass_downsampled_, cloud_hull_, *nonplane_cloud_);
-          target_cloud = nonplane_cloud_;
+          //planeSegmentation (cloud, *coefficients, *inliers);
+          planeSegmentation (cloud_pass_downsampled_, *coefficients, *inliers);
+          if (inliers->indices.size () > 3)
+          {
+            CloudPtr cloud_projected (new Cloud);
+            cloud_hull_.reset (new Cloud);
+            nonplane_cloud_.reset (new Cloud);
+            
+            //planeProjection (cloud, *cloud_projected, coefficients);
+            planeProjection (cloud_pass_downsampled_, *cloud_projected, coefficients);
+            convexHull (cloud_projected, *cloud_hull_, hull_vertices_);
+            extractNonPlanePoints (cloud_pass_downsampled_, cloud_hull_, *nonplane_cloud_);
+            target_cloud = nonplane_cloud_;
+          }
+          else
+          {
+            PCL_WARN ("cannot segment plane\n");
+          }
         }
         else
         {
-          PCL_WARN ("cannot segment plane\n");
+          PCL_WARN ("without plane segmentation\n");
+          target_cloud = cloud_pass_downsampled_;
+        }
+        
+        if (target_cloud != NULL)
+        {
+          PCL_INFO ("segmentation, please wait...\n");
+          std::vector<pcl::PointIndices> cluster_indices;
+          euclideanSegment (target_cloud, cluster_indices);
+          if (cluster_indices.size () > 0)
+          {
+            // select the cluster to track
+            CloudPtr temp_cloud (new Cloud);
+            extractSegmentCluster (target_cloud, cluster_indices, 0, *temp_cloud);
+            Eigen::Vector4f c;
+            pcl::compute3DCentroid<RefPointType> (*temp_cloud, c);
+            int segment_index = 0;
+            double segment_distance = c[0] * c[0] + c[1] * c[1];
+            for (size_t i = 1; i < cluster_indices.size (); i++)
+            {
+              temp_cloud.reset (new Cloud);
+              extractSegmentCluster (target_cloud, cluster_indices, int (i), *temp_cloud);
+              pcl::compute3DCentroid<RefPointType> (*temp_cloud, c);
+              double distance = c[0] * c[0] + c[1] * c[1];
+              if (distance < segment_distance)
+              {
+                segment_index = int (i);
+                segment_distance = distance;
+              }
+            }
+          
+            segmented_cloud_.reset (new Cloud);
+            extractSegmentCluster (target_cloud, cluster_indices, segment_index, *segmented_cloud_);
+            //pcl::PointCloud<pcl::Normal>::Ptr normals (new pcl::PointCloud<pcl::Normal>);
+            //normalEstimation (segmented_cloud_, *normals);
+            RefCloudPtr ref_cloud (new RefCloud);
+            //addNormalToCloud (segmented_cloud_, normals, *ref_cloud);
+            ref_cloud = segmented_cloud_;
+            reference_model_ = segmented_cloud_;
+            RefCloudPtr nonzero_ref (new RefCloud);
+            removeZeroPoints (ref_cloud, *nonzero_ref);
+          
+            PCL_INFO ("calculating cog\n");
+          
+            RefCloudPtr transed_ref (new RefCloud);
+            pcl::compute3DCentroid<RefPointType> (*nonzero_ref, c);
+            Eigen::Affine3f trans = Eigen::Affine3f::Identity ();
+            trans.translation ().matrix () = Eigen::Vector3f (c[0], c[1], c[2]);
+            //pcl::transformPointCloudWithNormals<RefPointType> (*ref_cloud, *transed_ref, trans.inverse());
+            pcl::transformPointCloud<RefPointType> (*nonzero_ref, *transed_ref, trans.inverse());
+            CloudPtr transed_ref_downsampled (new Cloud);
+            gridSample (transed_ref, *transed_ref_downsampled, downsampling_grid_size_);
+            tracker_->setReferenceCloud (transed_ref_downsampled);
+            tracker_->setTrans (trans);
+            reference_ = transed_ref;
+            tracker_->setMinIndices (int (ref_cloud->points.size ()) / 2);
+          }
+          else
+          {
+            PCL_WARN ("euclidean segmentation failed\n");
+          }
         }
       }
       else
       {
-        PCL_WARN ("without plane segmentation\n");
-        target_cloud = cloud_pass_downsampled_;
-      }
-      
-      if (target_cloud != NULL)
-      {
-        PCL_INFO ("segmentation, please wait...\n");
-        std::vector<pcl::PointIndices> cluster_indices;
-        euclideanSegment (target_cloud, cluster_indices);
-        if (cluster_indices.size () > 0)
+        reference_model_.reset (new RefCloud);
+        if (pcl::io::loadPCDFile (model_filename_, *reference_model_) < 0)
         {
-          // select the cluster to track
-          CloudPtr temp_cloud (new Cloud);
-          extractSegmentCluster (target_cloud, cluster_indices, 0, *temp_cloud);
-          Eigen::Vector4f c;
-          pcl::compute3DCentroid<RefPointType> (*temp_cloud, c);
-          int segment_index = 0;
-          double segment_distance = c[0] * c[0] + c[1] * c[1];
-          for (size_t i = 1; i < cluster_indices.size (); i++)
-          {
-            temp_cloud.reset (new Cloud);
-            extractSegmentCluster (target_cloud, cluster_indices, int (i), *temp_cloud);
-            pcl::compute3DCentroid<RefPointType> (*temp_cloud, c);
-            double distance = c[0] * c[0] + c[1] * c[1];
-            if (distance < segment_distance)
-            {
-              segment_index = int (i);
-              segment_distance = distance;
-            }
-          }
-          
-          segmented_cloud_.reset (new Cloud);
-          extractSegmentCluster (target_cloud, cluster_indices, segment_index, *segmented_cloud_);
-          //pcl::PointCloud<pcl::Normal>::Ptr normals (new pcl::PointCloud<pcl::Normal>);
-          //normalEstimation (segmented_cloud_, *normals);
-          RefCloudPtr ref_cloud (new RefCloud);
-          //addNormalToCloud (segmented_cloud_, normals, *ref_cloud);
-          ref_cloud = segmented_cloud_;
-          RefCloudPtr nonzero_ref (new RefCloud);
-          removeZeroPoints (ref_cloud, *nonzero_ref);
-          
-          PCL_INFO ("calculating cog\n");
-          
-          RefCloudPtr transed_ref (new RefCloud);
-          pcl::compute3DCentroid<RefPointType> (*nonzero_ref, c);
-          Eigen::Affine3f trans = Eigen::Affine3f::Identity ();
-          trans.translation ().matrix () = Eigen::Vector3f (c[0], c[1], c[2]);
-          //pcl::transformPointCloudWithNormals<RefPointType> (*ref_cloud, *transed_ref, trans.inverse());
-          pcl::transformPointCloud<RefPointType> (*nonzero_ref, *transed_ref, trans.inverse());
-          CloudPtr transed_ref_downsampled (new Cloud);
-          gridSample (transed_ref, *transed_ref_downsampled, downsampling_grid_size_);
-          tracker_->setReferenceCloud (transed_ref_downsampled);
-          tracker_->setTrans (trans);
-          reference_ = transed_ref;
-          tracker_->setMinIndices (int (ref_cloud->points.size ()) / 2);
+          std::cout << "Error loading model cloud." << std::endl;
+          exit (1);
         }
-        else
-        {
-          PCL_WARN ("euclidean segmentation failed\n");
-        }
+        RefCloudPtr nonzero_ref (new RefCloud);
+        removeZeroPoints (reference_model_, *nonzero_ref);
+
+        PCL_INFO ("calculating cog\n");
+        Eigen::Vector4f c;  
+        RefCloudPtr transed_ref (new RefCloud);
+        pcl::compute3DCentroid<RefPointType> (*nonzero_ref, c);
+        Eigen::Affine3f trans = Eigen::Affine3f::Identity ();
+        trans.translation ().matrix () = Eigen::Vector3f (c[0], c[1], c[2]);
+        //pcl::transformPointCloudWithNormals<RefPointType> (*reference_model_, *transed_ref, trans.inverse());
+        pcl::transformPointCloud<RefPointType> (*nonzero_ref, *transed_ref, trans.inverse());
+        CloudPtr transed_ref_downsampled (new Cloud);
+        gridSample (transed_ref, *transed_ref_downsampled, downsampling_grid_size_);
+        tracker_->setReferenceCloud (transed_ref_downsampled);
+        tracker_->setTrans (trans);
+        reference_ = transed_ref;
+        tracker_->setMinIndices (int (reference_model_->points.size ()) / 2);
       }
     }
     else
@@ -682,9 +732,11 @@ public:
   CloudPtr cloud_hull_;
   CloudPtr segmented_cloud_;
   CloudPtr reference_;
+  RefCloudPtr reference_model_;
   std::vector<pcl::Vertices> hull_vertices_;
   
   std::string device_id_;
+  std::string model_filename_;
   boost::mutex mtx_;
   bool new_cloud_;
   //pcl::NormalEstimationOMP< PointInT, PointOutT >
@@ -694,6 +746,7 @@ public:
   bool use_convex_hull_;
   bool visualize_non_downsample_;
   bool visualize_particles_;
+  bool use_fixed_model_;
   double tracking_time_;
   double computation_time_;
   double downsampling_time_;
@@ -714,6 +767,8 @@ usage (char** argv)
             << std::endl;
   std::cout << "  -d <value>: specify the grid size of downsampling (defaults to 0.01)."
             << std::endl;
+  std::cout << "  -M <model_file.pcd>: use the segmented model to track."
+            << std::endl;
 }
 
 int
@@ -723,8 +778,12 @@ main (int argc, char** argv)
   bool visualize_non_downsample = false;
   bool visualize_particles = true;
   bool use_fixed = false;
+  bool use_fixed_model_ = false;
 
   double downsampling_grid_size = 0.01;
+
+  std::string model_filename;
+  std::vector<int> filenames;
   
   if (pcl::console::find_argument (argc, argv, "-C") > 0)
     use_convex_hull = false;
@@ -734,7 +793,21 @@ main (int argc, char** argv)
     visualize_particles = false;
   if (pcl::console::find_argument (argc, argv, "-fixed") > 0)
     use_fixed = true;
+  if (pcl::console::find_argument (argc, argv, "-M") > 0)
+    use_fixed_model_ = true;
   pcl::console::parse_argument (argc, argv, "-d", downsampling_grid_size);
+  
+  if (use_fixed_model_)
+  {
+    filenames = pcl::console::parse_file_extension_argument (argc, argv, ".pcd");
+    if (filenames.size () == 0)
+    {
+      std::cout << "Filenames missing.\n";
+      exit (-1);
+    }
+    model_filename = argv[filenames[0]];
+  }
+
   if (argc < 2)
   {
     usage (argv);
@@ -753,6 +826,6 @@ main (int argc, char** argv)
   LibRealSenseSegmentTracking<pcl::PointXYZRGBA> v (device_id, 8, downsampling_grid_size,
                                               use_convex_hull,
                                               visualize_non_downsample, visualize_particles,
-                                              use_fixed);
+                                              use_fixed, use_fixed_model_, model_filename);
   v.run ();
 }
